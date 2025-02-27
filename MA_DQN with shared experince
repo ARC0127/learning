@@ -1,0 +1,166 @@
+import gymnasium as gym
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+import matplotlib.pyplot as plt  
+import warnings 
+warnings.filterwarnings("ignore")
+
+# 定义 Q 网络
+class QNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(QNetwork, self).__init__()
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        x = torch.relu(self.linear1(x))
+        x = torch.relu(self.linear2(x))
+        x = self.linear3(x)
+        return x
+
+def init_environment():
+    env = gym.make('CartPole-v1')
+    state_space_num = env.observation_space.shape[0]
+    action_space_dim = env.action_space.n
+    return env, state_space_num, action_space_dim
+
+def calculate_reward(state, next_state, done, step, negative_reward, positive_reward, x_bound, env):
+    x, x_dot, theta, theta_dot = state
+    r1 = (negative_reward * abs(x) / x_bound + 0.5 * (-negative_reward)) if abs(x) <= x_bound else 0.5 * negative_reward
+    r2 = (negative_reward * abs(theta) / env.theta_threshold_radians + 0.5 * (-negative_reward)) if abs(theta) <= env.theta_threshold_radians else 0.5 * negative_reward
+    reward = r1 + r2
+
+    if done and step < 499:
+        reward += negative_reward
+    return reward
+
+def train_dqn():
+    env, state_space_num, action_space_dim = init_environment()
+    
+    # 超参数设置
+    negative_reward = -10.0
+    positive_reward = 10.0
+    x_bound = 1.0
+    gamma = 0.99
+    batch_size = 32
+    capacity = 1000
+    total_episode = 50
+    agents_num = 5
+    
+    agents = []
+    for _ in range(agents_num):
+        q_net = QNetwork(state_space_num, 256, action_space_dim)
+        target_q_net = QNetwork(state_space_num, 256, action_space_dim)
+        target_q_net.load_state_dict(q_net.state_dict())  # 初始同步参数
+        optimizer = optim.Adam(q_net.parameters(), lr=5e-3)
+        agents.append({
+            'q_net': q_net,
+            'target_q_net': target_q_net,
+            'optimizer': optimizer,
+            'rewards': []
+        })
+
+    # 全局共享的经验回放缓冲区
+    global_buffer = deque(maxlen=capacity)
+
+    global_rewards = []
+
+    for i in range(total_episode):
+        episode_rewards = []
+        best_agent_index = 0
+        best_reward = -float('inf')
+
+        # 每个智能体分别训练一个episode
+        for agent_index, agent in enumerate(agents):
+            state, _ = env.reset()  # 正确解包reset返回值
+            episode_reward = 0  # 记录实际环境奖励（每个step+1）
+            step = 0
+            
+            while True:
+                epsilon = 1.0 / (i + 1)
+                if random.random() < epsilon:
+                    action = env.action_space.sample()
+                else:
+                    with torch.no_grad():
+                        state_tensor = torch.FloatTensor(state)
+                        action = agent['q_net'](state_tensor).argmax().item()
+                
+                # 执行动作并获取五个返回值
+                next_state, original_reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                
+                # 计算自定义训练奖励
+                custom_reward = calculate_reward(state, next_state, done, step, 
+                                               negative_reward, positive_reward, x_bound, env)
+                
+                # 记录实际环境奖励（每个step+1）
+                episode_reward += original_reward  
+                
+                # 存储经验到全局缓冲区（包含done标记）
+                global_buffer.append((state, action, custom_reward, next_state, done))
+                
+                # 经验回放训练
+                if len(global_buffer) >= batch_size:
+                    samples = random.sample(global_buffer, batch_size)
+                    s0, a0, r1, s1, dones = zip(*samples)
+                    
+                    s0 = torch.FloatTensor(s0)
+                    a0 = torch.LongTensor(a0).unsqueeze(1)
+                    r1 = torch.FloatTensor(r1).unsqueeze(1)
+                    s1 = torch.FloatTensor(s1)
+                    dones = torch.BoolTensor(dones).unsqueeze(1)
+                    
+                    # 计算目标Q值（使用目标网络，不计算梯度）
+                    with torch.no_grad():
+                        q_next = agent['target_q_net'](s1).max(dim=1)[0].view(-1, 1)
+                        q_target = r1 + gamma * q_next * (~dones)
+                    
+                    # 计算当前Q值（使用Q网络，计算梯度）
+                    q_values = agent['q_net'](s0).gather(1, a0)
+                    
+                    # 计算损失并更新网络
+                    loss = nn.MSELoss()(q_values, q_target)
+                    agent['optimizer'].zero_grad()
+                    loss.backward()
+                    agent['optimizer'].step()
+                
+                state = next_state
+                step += 1
+
+                # 定期更新目标网络
+                if step % 10 == 0:
+                    agent['target_q_net'].load_state_dict(agent['q_net'].state_dict())
+                
+                if done:
+                    # 实际奖励上限500（环境自动处理）
+                    agent['rewards'].append(min(episode_reward, 500))  
+                    episode_rewards.append(min(episode_reward, 500))
+                    if episode_reward > best_reward:
+                        best_reward = episode_reward
+                        best_agent_index = agent_index
+                    print(f"Agent {agent_index + 1}, Episode {i+1}, Steps {step}, Reward {min(episode_reward, 500)}")
+                    break
+
+        # 记录全局奖励
+        global_rewards.append(max(episode_rewards))
+        
+        # 在下一个episode中，所有智能体以最佳模型为基础进行训练
+        if i < total_episode - 1:
+            best_agent = agents[best_agent_index]
+            for agent in agents:
+                agent['q_net'].load_state_dict(best_agent['q_net'].state_dict())
+                agent['target_q_net'].load_state_dict(best_agent['target_q_net'].state_dict())
+
+    env.close()
+    plt.plot(global_rewards)
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.title('Training Progress')
+    plt.show()
+
+if __name__ == '__main__':
+    train_dqn()
