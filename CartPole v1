@@ -1,0 +1,157 @@
+# reward部分参考https://www.cnblogs.com/tiandsp/p/18133282
+import gym
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+import matplotlib.pyplot as plt  
+
+# 定义 Q 网络
+class QNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        """
+        初始化 Q 网络结构
+        """
+        super(QNetwork, self).__init__()
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        """
+        前向传播：输入状态，输出 Q 值
+        """
+        x = torch.relu(self.linear1(x))
+        x = torch.relu(self.linear2(x))
+        x = self.linear3(x)
+        return x
+
+# 初始化环境和超参数
+def init_environment():
+    """
+    初始化 CartPole 环境
+    """
+    env = gym.make('CartPole-v1')
+    state_space_num = env.observation_space.shape[0]
+    action_space_dim = env.action_space.n
+    return env, state_space_num, action_space_dim
+
+# 计算奖励
+def calculate_reward(state, next_state, done, step, negative_reward, positive_reward, x_bound, env):
+    """
+    自定义奖励函数
+    """
+    x, x_dot, theta, theta_dot = state
+    r1 = negative_reward * abs(x) / x_bound + 0.5 * (-negative_reward) if abs(x) <= x_bound else 0.5 * negative_reward
+    r2 = negative_reward * abs(theta) / env.theta_threshold_radians + 0.5 * (-negative_reward) if abs(theta) <= env.theta_threshold_radians else 0.5 * negative_reward
+    reward = r1 + r2
+
+    if done and step < 499:
+        reward += negative_reward
+    
+    return reward
+
+# 训练过程
+def train_dqn():
+    """
+    训练 DQN 网络
+    """
+    # 环境和超参数初始化
+    env, state_space_num, action_space_dim = init_environment()
+    
+    # 超参数设置
+    negative_reward = -10.0
+    positive_reward = 10.0
+    x_bound = 1.0
+    gamma = 0.9
+    batch_size = 32
+    capacity = 1e3
+    buffer = []
+    total_episode = 150
+    
+    # 初始化 Q 网络和优化器
+    q_net = QNetwork(state_space_num, 256, action_space_dim)
+    target_q_net = QNetwork(state_space_num, 256, action_space_dim)
+    optimizer = optim.Adam(q_net.parameters(), lr=5e-4)
+
+    # 用于记录奖励的列表
+    rewards = []
+
+    # 训练循环
+    for i in range(total_episode):
+        state = env.reset()
+        step = 0
+        total_reward = 0  # 用于记录每一回合的总奖励
+        
+        while True:
+            step += 1
+            epsilon = 1.0 / (i + 1)  # epsilon 贪婪策略
+            if random.random() < epsilon:
+                action = random.randrange(action_space_dim)  # 随机选择动作
+            else:
+                state_tensor = torch.tensor(state, dtype=torch.float).view(1, -1)
+                action = torch.argmax(q_net(state_tensor)).item()  # 选择 Q 值最大的动作
+            
+            # 执行动作并获得奖励
+            next_state, reward, done, _ = env.step(action)
+            reward = calculate_reward(state, next_state, done, step, negative_reward, positive_reward, x_bound, env)
+
+            total_reward += reward  # 累加当前回合的奖励
+
+            # 限制奖励上限为500
+            total_reward = min(total_reward, 500)
+
+            # 将经验存入缓冲区
+            if len(buffer) == capacity:
+                buffer.pop(0)
+            buffer.append((state, action, reward, next_state))
+            
+            state = next_state
+
+            # 当缓冲区经验不足时跳过训练
+            if len(buffer) < batch_size:
+                continue
+            
+            # 采样批量经验进行训练
+            samples = random.sample(buffer, batch_size)
+            s0, a0, r1, s1 = zip(*samples)
+            s0 = torch.tensor(s0, dtype=torch.float)
+            a0 = torch.tensor(a0, dtype=torch.long).view(batch_size, 1)
+            r1 = torch.tensor(r1, dtype=torch.float).view(batch_size, 1)
+            s1 = torch.tensor(s1, dtype=torch.float)
+            
+            # 计算 Q 值和目标 Q 值
+            q_value = q_net(s0).gather(1, a0)
+            q_target = r1 + gamma * torch.max(target_q_net(s1).detach(), dim=1)[0].view(batch_size, -1)
+
+            # 计算损失并更新 Q 网络
+            loss_fn = nn.MSELoss()
+            loss = loss_fn(q_value, q_target)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # 更新目标网络
+            if i % 10 == 0:
+                target_q_net.load_state_dict(q_net.state_dict())
+
+            # 输出当前回合的结果
+            if done:
+                rewards.append(total_reward)  # 记录每回合的奖励
+                print(f"Episode {i}, Step {step}, Total Reward {total_reward}")
+                break
+
+    # 关闭环境
+    env.close()
+
+    # 可视化训练结果
+    plt.plot(range(total_episode), rewards)  # 绘制每回合的总奖励
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.title('Training Reward Over Episodes')
+    plt.show()
+
+# 主函数
+if __name__ == '__main__':
+    train_dqn()
